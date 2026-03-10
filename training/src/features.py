@@ -55,6 +55,7 @@ def add_all_features(
     orders: pl.DataFrame,
     products: pl.DataFrame | None = None,
     commerces: pl.DataFrame | None = None,
+    include_seasonality: bool = False,
     config: object | None = None,      # kept for backward-compat; ignored
 ) -> pl.DataFrame:
     """Add all features to the base feature table."""
@@ -63,4 +64,5 @@ def add_all_features(
         orders=orders,
         products=products,
         commerces=commerces,
+        include_seasonality=include_seasonality,
     )

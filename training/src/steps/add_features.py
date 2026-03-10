@@ -12,9 +12,17 @@ Features added:
   cand_is_new        — 1 if the kiosk has never ordered the candidate before
   channel            — kiosk sales channel  (categorical, kept as string)
   region             — kiosk geographic region (categorical, kept as string)
+
+Seasonality features (when enabled):
+  query_month_sin    — sin(2π·month/12)   cyclical month encoding of query time
+  query_month_cos    — cos(2π·month/12)   cyclical month encoding of query time
+  cand_seasonal_pop  — candidate popularity in query month vs average month
+  cand_recency_days  — days since the kiosk last ordered this candidate (capped at 365)
 """
 
 from __future__ import annotations
+
+import math
 
 import polars as pl
 
@@ -27,6 +35,7 @@ def add_features(
     orders: pl.DataFrame,
     products: pl.DataFrame | None = None,
     commerces: pl.DataFrame | None = None,
+    include_seasonality: bool = False,
 ) -> pl.DataFrame:
     """Add all features to the base feature table in a single pass."""
     ft = feature_table
@@ -109,5 +118,111 @@ def add_features(
             "region",
         )
         ft = ft.join(comm, on="kiosk_id", how="left")
+
+    # ---- seasonality features ----
+    if include_seasonality:
+        ft = _add_seasonality_features(ft, orders=orders)
+
+    return ft
+
+
+# ============================================================
+# Seasonality helpers
+# ============================================================
+
+def _add_seasonality_features(
+    ft: pl.DataFrame,
+    *,
+    orders: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Add time-aware features that capture seasonal purchase patterns.
+
+    Features:
+      query_month_sin / query_month_cos — cyclical encoding of the kiosk's
+          latest order month (a proxy for "query time").
+      cand_seasonal_pop — ratio of candidate orders in the query month
+          versus its average monthly orders. >1 means the product is popular
+          *in that month*.
+      cand_recency_days — days since the kiosk last ordered this candidate.
+          Capped at 365; set to 365 if never ordered.
+    """
+
+    # 1) Determine "query month" for each kiosk — use the latest order date.
+    kiosk_latest = (
+        orders
+        .group_by("kiosk_id")
+        .agg(pl.col("order_dt").max().alias("latest_order_dt"))
+        .with_columns(
+            pl.col("latest_order_dt").dt.month().alias("query_month"),
+        )
+    )
+
+    ft = ft.join(
+        kiosk_latest.select("kiosk_id", "query_month", "latest_order_dt"),
+        on="kiosk_id",
+        how="left",
+    )
+
+    # 2) Cyclical month encoding (sin/cos)
+    ft = ft.with_columns(
+        (2.0 * math.pi * pl.col("query_month").cast(pl.Float64) / 12.0)
+        .sin()
+        .alias("query_month_sin"),
+        (2.0 * math.pi * pl.col("query_month").cast(pl.Float64) / 12.0)
+        .cos()
+        .alias("query_month_cos"),
+    )
+
+    # 3) Candidate seasonal popularity — orders in month / avg monthly orders
+    product_monthly = (
+        orders
+        .with_columns(pl.col("order_dt").dt.month().alias("month"))
+        .group_by(["product_id", "month"])
+        .len()
+        .rename({"len": "month_orders"})
+    )
+    product_avg = (
+        product_monthly
+        .group_by("product_id")
+        .agg(pl.col("month_orders").mean().alias("avg_monthly_orders"))
+    )
+    product_seasonal = product_monthly.join(product_avg, on="product_id", how="left").with_columns(
+        (pl.col("month_orders") / pl.col("avg_monthly_orders"))
+        .fill_null(1.0)
+        .alias("cand_seasonal_pop"),
+    ).select("product_id", "month", "cand_seasonal_pop")
+
+    ft = ft.join(
+        product_seasonal,
+        left_on=["candidate_product_id", "query_month"],
+        right_on=["product_id", "month"],
+        how="left",
+    ).with_columns(pl.col("cand_seasonal_pop").fill_null(1.0))
+
+    # 4) Recency — days since the kiosk last ordered this candidate
+    kiosk_product_last = (
+        orders
+        .group_by(["kiosk_id", "product_id"])
+        .agg(pl.col("order_dt").max().alias("last_cand_order_dt"))
+    )
+    ft = ft.join(
+        kiosk_product_last,
+        left_on=["kiosk_id", "candidate_product_id"],
+        right_on=["kiosk_id", "product_id"],
+        how="left",
+    )
+    ft = ft.with_columns(
+        (
+            (pl.col("latest_order_dt") - pl.col("last_cand_order_dt"))
+            .dt.total_days()
+            .fill_null(365)
+            .clip(0, 365)
+            .cast(pl.Float64)
+        ).alias("cand_recency_days"),
+    )
+
+    # Drop intermediate columns
+    ft = ft.drop(["query_month", "latest_order_dt", "last_cand_order_dt"], strict=False)
 
     return ft

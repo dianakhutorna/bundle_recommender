@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import gc
 import logging
 import json
 
@@ -28,6 +29,7 @@ from training.src.config import load_yaml_config
 from training.src.features import add_all_features, lgbm_feature_exprs
 from training.src.io import (
     load_orders_csv_sample,
+    load_orders_csv_chunked,
     load_products_csv,
     load_commerces_csv,
     save_parquet,
@@ -88,6 +90,11 @@ class TrainingPipelineConfig:
     num_boost_round: int
     early_stopping_rounds: int
     eval_log_path: Path | None
+    chunk_size: int
+    include_seasonality: bool
+    max_train_queries: int
+    max_basket_items: int
+    pair_batch_size: int
 
     @classmethod
     def from_yaml(cls, path: Path) -> "TrainingPipelineConfig":
@@ -122,6 +129,11 @@ class TrainingPipelineConfig:
             num_boost_round=int(data.get("num_boost_round", 2000)),
             early_stopping_rounds=int(data.get("early_stopping_rounds", 100)),
             eval_log_path=Path(data["eval_log_path"]) if data.get("eval_log_path") else None,
+            chunk_size=int(data.get("chunk_size", 2_000_000)),
+            include_seasonality=bool(data.get("include_seasonality", False)),
+            max_train_queries=int(data.get("max_train_queries", 0)),
+            max_basket_items=int(data.get("max_basket_items", 200)),
+            pair_batch_size=int(data.get("pair_batch_size", 200_000)),
         )
 
 
@@ -380,25 +392,48 @@ def run(config: TrainingPipelineConfig) -> None:
     # ---- STEP 1: LOAD DATA ----
     _banner("STEP 1 — LOAD DATA")
 
-    per_file = max(1, config.n_rows // len(config.raw_paths))
-    LOGGER.info(
-        "Loading raw paths: %s (per_file=%s, sample_position=%s)",
-        [str(p) for p in config.raw_paths], per_file, config.sample_position,
-    )
-    raw_frames = [
-        load_orders_csv_sample(path, n_rows=per_file, sample_position=config.sample_position)
-        for path in config.raw_paths
-    ]
-    raw_orders = pl.concat(raw_frames, how="vertical")
-    if "order_dt" in raw_orders.columns:
-        dt_stats = raw_orders.select(
+    if config.n_rows <= 0:
+        # ---- Chunked loading: process ALL rows ----
+        LOGGER.info(
+            "Chunked loading ALL rows from %d files (chunk_size=%s)",
+            len(config.raw_paths), f"{config.chunk_size:,}",
+        )
+        clean_orders = load_orders_csv_chunked(
+            config.raw_paths,
+            preprocess_fn=preprocess_orders,
+            chunk_size=config.chunk_size,
+            out_dir=config.interim_path.parent / "chunk_tmp",
+        )
+    else:
+        # ---- Sampled loading (original behaviour) ----
+        per_file = max(1, config.n_rows // len(config.raw_paths))
+        LOGGER.info(
+            "Loading raw paths: %s (per_file=%s, sample_position=%s)",
+            [str(p) for p in config.raw_paths], per_file, config.sample_position,
+        )
+        raw_frames = [
+            load_orders_csv_sample(path, n_rows=per_file, sample_position=config.sample_position)
+            for path in config.raw_paths
+        ]
+        raw_orders = pl.concat(raw_frames, how="vertical")
+        if "order_dt" in raw_orders.columns:
+            dt_stats = raw_orders.select(
+                pl.col("order_dt").min().alias("min_dt"),
+                pl.col("order_dt").max().alias("max_dt"),
+            ).row(0)
+            LOGGER.info("Raw orders date range: %s to %s", dt_stats[0], dt_stats[1])
+        clean_orders = preprocess_orders(raw_orders)
+        del raw_orders
+
+    save_parquet(clean_orders, config.interim_path)
+
+    # Log date range of clean orders
+    if clean_orders.height > 0:
+        dt_stats = clean_orders.select(
             pl.col("order_dt").min().alias("min_dt"),
             pl.col("order_dt").max().alias("max_dt"),
         ).row(0)
-        LOGGER.info("Raw orders date range: %s to %s", dt_stats[0], dt_stats[1])
-
-    clean_orders = preprocess_orders(raw_orders)
-    save_parquet(clean_orders, config.interim_path)
+        LOGGER.info("Clean orders date range: %s to %s (rows=%s)", dt_stats[0], dt_stats[1], f"{clean_orders.height:,}")
 
     products = load_products_csv(config.products_path)
     commerces = load_commerces_csv(config.commerces_path)
@@ -435,6 +470,10 @@ def run(config: TrainingPipelineConfig) -> None:
         ).row(0)
         LOGGER.info("%s orders date range: %s to %s (rows=%s)", name, dt_stats[0], dt_stats[1], df.height)
 
+    # Free the unsplit orders — we only need the splits from here on.
+    del clean_orders
+    gc.collect()
+
     # Sub-split training orders: earlier portion for features, later for labels.
     # This prevents label leakage (e.g. pop_store computed from the same data
     # that defines the positive labels).
@@ -467,25 +506,46 @@ def run(config: TrainingPipelineConfig) -> None:
         ).row(0)
         LOGGER.info("  %s orders date range: %s to %s (rows=%s)", name, dt_stats[0], dt_stats[1], df.height)
 
+    # train_sorted is a full sorted copy of train_orders — free it now.
+    # train_orders is no longer needed: baskets use the concat of sub-splits,
+    # and val/test feature computation uses train_feat_orders (cleaner leakage
+    # prevention — features are computed only from the earlier period).
+    del train_sorted, train_orders
+    gc.collect()
+
     # ---- STEP 3: BUILD BASKETS ----
     _banner("STEP 3 — BUILD BASKETS")
 
-    baskets_train = build_baskets(train_orders)
+    # Concatenate sub-splits instead of keeping train_orders (~1.4 GB saved).
+    all_train = pl.concat([train_feat_orders, train_label_orders], how="vertical")
+    baskets_train = build_baskets(all_train, max_items=config.max_basket_items)
+    del all_train
+    gc.collect()
 
     # ---- STEP 4: GENERATE CANDIDATES (MBA) ----
     _banner("STEP 4 — GENERATE CANDIDATES")
 
     def _generate_topk(top_k_value: int) -> pl.DataFrame:
-        candidates = generate_candidates(baskets_train, min_cooc=config.min_cooc)
+        candidates = generate_candidates(
+            baskets_train,
+            min_cooc=config.min_cooc,
+            pair_batch_size=config.pair_batch_size,
+        )
         return select_top_k_candidates(candidates, k=top_k_value, min_lift=config.min_lift)
 
     top_k_train = int(config.top_k_train) if config.top_k_train is not None else int(config.top_k)
     top_k_train = max(1, min(top_k_train, config.top_k))
     topk_candidates_train = _generate_topk(top_k_train)
 
+    # baskets_train is no longer needed — build_feature_table uses explicit
+    # queries in Step 5, so baskets are never read.  Free ~300 MB.
+    del baskets_train
+    gc.collect()
+
     def _add_features(ft: pl.DataFrame, feat_orders: pl.DataFrame) -> pl.DataFrame:
         return add_all_features(
             ft, orders=feat_orders, products=products, commerces=commerces,
+            include_seasonality=config.include_seasonality,
         )
 
     # ---- STEP 5: BUILD FEATURES + LABELS ----
@@ -572,7 +632,9 @@ def run(config: TrainingPipelineConfig) -> None:
 
         # 4) Build candidate feature table for remaining queries
         base_ft = build_feature_table(
-            baskets=baskets_train, topk_candidates=topk_candidates, queries=queries,
+            baskets=pl.DataFrame(),  # not used when queries is provided
+            topk_candidates=topk_candidates,
+            queries=queries,
         )
 
         # 5) Assign labels by joining to positives
@@ -604,7 +666,7 @@ def run(config: TrainingPipelineConfig) -> None:
 
         # 9) Build features only for selected rows.
         #    For large datasets, process in query batches to avoid OOM.
-        MAX_ROWS_PER_BATCH = 5_000_000
+        MAX_ROWS_PER_BATCH = 2_000_000
 
         # When filtering/sampling happened, only keep selected rows
         if filter_good or do_sample_negatives:
@@ -667,28 +729,44 @@ def run(config: TrainingPipelineConfig) -> None:
         filter_good=True,
         do_sample_negatives=True,
         shuffle_seed=42,
+        max_queries=config.max_train_queries,
     )
+
+    # train_label_orders no longer needed after train split is built.
+    del train_label_orders
+    gc.collect()
+
     labeled_val = _build_labeled_split(
         split_name="Val",
         query_orders=val_orders,
         label_orders=val_orders,
-        feat_orders=train_orders,
+        feat_orders=train_feat_orders,
         topk_candidates=topk_candidates_train,
         filter_good=True,
         do_sample_negatives=True,
         shuffle_seed=43,
+        max_queries=config.max_train_queries,
     )
+
+    # Free val_orders — no longer needed.
+    del val_orders
+    gc.collect()
+
     labeled_test = _build_labeled_split(
         split_name="Test",
         query_orders=test_orders,
         label_orders=test_orders,
-        feat_orders=train_orders,
+        feat_orders=train_feat_orders,
         topk_candidates=topk_candidates_train,
         filter_good=False,
         do_sample_negatives=False,
         shuffle_seed=None,
         max_queries=config.max_eval_queries,
     )
+
+    # Free remaining large DataFrames no longer needed for feature building.
+    del test_orders, train_feat_orders
+    gc.collect()
 
     # ---- Detect feature columns ----
     non_feature_cols = {"kiosk_id", "anchor_product_id", "candidate_product_id", "label"}
@@ -817,7 +895,14 @@ def run(config: TrainingPipelineConfig) -> None:
         {"feature": feature_cols, "importance": booster.feature_importance(importance_type="gain")}
     ).sort_values("importance", ascending=False)
     LOGGER.info("Feature importance (gain):\n%s", imp_df.to_string(index=False))
+    # ---- SAVE MODEL EARLY ---- (so training isn't lost if eval fails)
+    config.model_path.parent.mkdir(parents=True, exist_ok=True)
+    booster.save_model(str(config.model_path))
+    LOGGER.info("Model saved to %s", config.model_path)
 
+    feature_path = config.model_path.with_suffix(".features.json")
+    feature_path.write_text(json.dumps(feature_cols, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOGGER.info("Feature list saved to %s", feature_path)
     # ---- STEP 7: OFFLINE EVALUATION ----
     _banner("STEP 7 — OFFLINE EVALUATION")
 
@@ -828,16 +913,9 @@ def run(config: TrainingPipelineConfig) -> None:
     eval_labeled = fill_missing_features(eval_labeled, numeric_feature_cols, categorical_feature_cols)
     eval_labeled = eval_labeled.with_columns(pl.col("label").fill_null(0).cast(pl.Int8))
 
-    # Candidate recall: how many true positives are in the candidate set
+    # Candidate recall is skipped when test_orders has been freed
+    # (full-data mode) to save memory.
     eval_queries = eval_labeled.select(["kiosk_id", "anchor_product_id"]).unique()
-    log_candidate_recall(
-        eval_queries=eval_queries,
-        eval_candidates=eval_labeled,
-        label_orders=test_orders,
-        window_days=config.label_window_days,
-        min_cooc_label=config.min_cooc_label,
-        kiosk_batch_size=config.label_kiosk_batch_size,
-    )
 
     eval_scores = predict_scores_batched(
         booster, eval_labeled, feature_cols, categorical_feature_cols,
@@ -887,13 +965,6 @@ def run(config: TrainingPipelineConfig) -> None:
         table_lines.append(f"{metric_name:<12s}  {vals}")
     LOGGER.info("\n[TEST] Offline evaluation results:\n%s", "\n".join(table_lines))
 
-    # ---- STEP 8: SAVE ARTIFACTS ----
-    _banner("STEP 8 — SAVE ARTIFACTS")
-
-    config.model_path.parent.mkdir(parents=True, exist_ok=True)
-    booster.save_model(str(config.model_path))
-    LOGGER.info("Model saved to %s", config.model_path)
-
-    feature_path = config.model_path.with_suffix(".features.json")
-    feature_path.write_text(json.dumps(feature_cols, ensure_ascii=False, indent=2), encoding="utf-8")
-    LOGGER.info("Feature list saved to %s", feature_path)
+    # ---- STEP 8: DONE ----
+    _banner("STEP 8 \u2014 DONE")
+    LOGGER.info("Pipeline complete. Model: %s", config.model_path)

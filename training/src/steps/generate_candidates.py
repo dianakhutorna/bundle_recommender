@@ -37,29 +37,81 @@ def _product_counts(exploded: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _pair_products(exploded: pl.DataFrame) -> pl.DataFrame:
-    return (
-        exploded
-        .join(
-            exploded,
-            on="order_id",
-            how="inner",
-        )
-        .rename({
-            "product_id": "anchor_product_id",
-            "product_id_right": "candidate_product_id",
-        })
-        .filter(pl.col("anchor_product_id") != pl.col("candidate_product_id"))
+def _pair_products_batched(
+    exploded: pl.DataFrame,
+    *,
+    batch_size: int = 200_000,
+    min_cooc: int = 2,
+) -> pl.DataFrame:
+    """
+    Generate anchor-candidate pair co-occurrence counts via batched
+    self-join to limit peak memory.
+
+    Instead of joining the full exploded table against itself, we split
+    order IDs into batches, perform the self-join per batch, aggregate
+    locally, then merge across batches.
+    """
+    order_ids = exploded.select("order_id").unique().to_series()
+    n_orders = len(order_ids)
+    n_batches = max(1, (n_orders + batch_size - 1) // batch_size)
+    LOGGER.info(
+        "Pair generation: %s orders in %d batches of ~%s",
+        f"{n_orders:,}", n_batches, f"{batch_size:,}",
     )
+
+    parts: list[pl.DataFrame] = []
+    for i in range(0, n_orders, batch_size):
+        batch_ids = order_ids.slice(i, min(batch_size, n_orders - i))
+        batch_exploded = exploded.filter(pl.col("order_id").is_in(batch_ids))
+
+        # Self-join within batch
+        pairs = (
+            batch_exploded
+            .join(batch_exploded, on="order_id", how="inner")
+            .rename({
+                "product_id": "anchor_product_id",
+                "product_id_right": "candidate_product_id",
+            })
+            .filter(pl.col("anchor_product_id") != pl.col("candidate_product_id"))
+        )
+
+        # Aggregate co-occurrences within this batch
+        batch_cooc = (
+            pairs
+            .group_by(["anchor_product_id", "candidate_product_id"])
+            .agg(pl.len().alias("cooc_count"))
+        )
+        parts.append(batch_cooc)
+        del pairs, batch_exploded, batch_cooc
+
+        if (i // batch_size + 1) % 10 == 0:
+            LOGGER.info("  batch %d/%d done", i // batch_size + 1, n_batches)
+
+    # Merge co-occurrences across batches
+    LOGGER.info("Merging co-occurrence counts from %d batches...", len(parts))
+    all_cooc = pl.concat(parts, how="vertical_relaxed")
+    del parts
+
+    merged = (
+        all_cooc
+        .group_by(["anchor_product_id", "candidate_product_id"])
+        .agg(pl.col("cooc_count").sum().alias("cooc_count"))
+        .filter(pl.col("cooc_count") >= min_cooc)
+    )
+    del all_cooc
+    return merged
 
 
 def generate_candidates(
     baskets: pl.DataFrame,
     min_cooc: int = 2,
+    pair_batch_size: int = 200_000,
 ) -> pl.DataFrame:
     """
     Generate anchor-candidate pairs from baskets and compute
     co-occurrence-based metrics + co-occurrence cosine similarity.
+
+    Memory-safe: uses batched self-join and pre-filters rare products.
 
     baskets columns:
     - kiosk_id
@@ -89,6 +141,9 @@ def generate_candidates(
     # 1. Explode baskets → (order_id, product_id)
     # ------------------------------------------------------------------
     exploded = _explode_baskets(baskets)
+    LOGGER.info("Exploded: %s rows, %s unique products",
+                f"{exploded.height:,}",
+                f"{exploded.select(pl.col('product_id').n_unique()).item():,}")
 
     # ------------------------------------------------------------------
     # 2. Product frequencies (global)
@@ -98,19 +153,29 @@ def generate_candidates(
     total_baskets = baskets.height
 
     # ------------------------------------------------------------------
-    # 3. Anchor–candidate pairs INSIDE THE SAME BASKET
+    # 3. Pre-filter: remove products that appear in fewer than min_cooc
+    #    baskets — they can never form a valid pair with cooc >= min_cooc.
+    #    This dramatically reduces the self-join size.
     # ------------------------------------------------------------------
-    pairs = _pair_products(exploded)
+    frequent_products = (
+        product_counts
+        .filter(pl.col("product_count") >= min_cooc)
+        .select("product_id")
+    )
+    exploded_before = exploded.height
+    exploded = exploded.join(frequent_products, on="product_id", how="inner")
+    LOGGER.info(
+        "Pre-filter: kept %s / %s exploded rows (products with count >= %d)",
+        f"{exploded.height:,}", f"{exploded_before:,}", min_cooc,
+    )
 
     # ------------------------------------------------------------------
-    # 4. Co-occurrence counts
+    # 4. Anchor–candidate pairs via batched self-join
     # ------------------------------------------------------------------
-    cooc = (
-        pairs
-        .group_by(["anchor_product_id", "candidate_product_id"])
-        .agg(pl.len().alias("cooc_count"))
-        .filter(pl.col("cooc_count") >= min_cooc)
+    cooc = _pair_products_batched(
+        exploded, batch_size=pair_batch_size, min_cooc=min_cooc,
     )
+    del exploded
 
     # ------------------------------------------------------------------
     # 5. Join product frequencies

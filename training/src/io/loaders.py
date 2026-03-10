@@ -124,6 +124,123 @@ def load_commerces_csv(path: Path, separator: str = ";") -> pl.DataFrame:
     return df
 
 
+def load_orders_csv_chunked(
+    raw_paths: list[Path],
+    *,
+    preprocess_fn,
+    chunk_size: int = 2_000_000,
+    out_dir: Path | None = None,
+) -> pl.DataFrame:
+    """
+    Load one or more large CSV files in chunks, preprocess each chunk,
+    and return a single concatenated DataFrame.
+
+    This keeps peak memory low: only one chunk of raw data (~16 cols)
+    is in memory at a time; after preprocessing it shrinks to 5 cols.
+
+    Parameters
+    ----------
+    raw_paths : list of Paths to CSV files.
+    preprocess_fn : callable(pl.DataFrame) -> pl.DataFrame
+        Applied to every chunk (e.g. ``preprocess_orders``).
+    chunk_size : rows per chunk (default 2M — ~500 MB raw peak).
+    out_dir : if given, each preprocessed chunk is saved as parquet
+        to this directory and only the final concat uses memory.
+
+    Returns
+    -------
+    pl.DataFrame  — concatenated, preprocessed orders.
+    """
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    schema_overrides = {
+        "orderid": pl.Utf8,
+        "productid": pl.Utf8,
+        "userid": pl.Utf8,
+        "documentcode": pl.Utf8,
+        "documenttype": pl.Utf8,
+        "currency": pl.Utf8,
+        "origin": pl.Utf8,
+        "sellerid": pl.Utf8,
+        "sellerrouteid": pl.Utf8,
+        "couponcode": pl.Utf8,
+        "priceperunit": pl.Float64,
+        "tax": pl.Float64,
+        "discountperunit": pl.Float64,
+        "discountedpriceperunit": pl.Float64,
+        "quantity": pl.Float64,
+    }
+
+    chunk_paths: list[Path] = []
+    parts: list[pl.DataFrame] = []
+    total_raw = 0
+    total_clean = 0
+
+    for file_idx, raw_path in enumerate(raw_paths):
+        if not raw_path.exists():
+            raise FileNotFoundError(f"Raw file not found: {raw_path}")
+
+        LOGGER.info("Chunked loading: file %d/%d — %s", file_idx + 1, len(raw_paths), raw_path)
+        t0 = time.perf_counter()
+
+        reader = pl.read_csv_batched(
+            raw_path,
+            has_header=True,
+            separator=",",
+            try_parse_dates=False,
+            infer_schema_length=0,
+            schema_overrides=schema_overrides,
+            batch_size=chunk_size,
+        )
+
+        chunk_idx = 0
+        while True:
+            batches = reader.next_batches(1)
+            if batches is None or len(batches) == 0:
+                break
+            raw_chunk = batches[0]
+            total_raw += raw_chunk.height
+            clean_chunk = preprocess_fn(raw_chunk)
+            total_clean += clean_chunk.height
+
+            if out_dir is not None:
+                p = out_dir / f"chunk_{file_idx:02d}_{chunk_idx:04d}.parquet"
+                clean_chunk.write_parquet(p, compression="zstd")
+                chunk_paths.append(p)
+            else:
+                parts.append(clean_chunk)
+
+            del raw_chunk, clean_chunk
+            chunk_idx += 1
+
+        elapsed = time.perf_counter() - t0
+        LOGGER.info(
+            "  file done in %.1fs — %d chunks processed", elapsed, chunk_idx,
+        )
+
+    LOGGER.info(
+        "Chunked loading complete: raw_rows=%s, clean_rows=%s, files=%d",
+        f"{total_raw:,}", f"{total_clean:,}", len(raw_paths),
+    )
+
+    # Concatenate
+    if out_dir is not None and chunk_paths:
+        result = pl.concat(
+            [pl.read_parquet(p) for p in chunk_paths],
+            how="vertical_relaxed",
+        )
+        # Cleanup temp chunk files
+        for p in chunk_paths:
+            p.unlink(missing_ok=True)
+    elif parts:
+        result = pl.concat(parts, how="vertical_relaxed")
+    else:
+        raise ValueError("No data loaded from any file.")
+
+    return result
+
+
 def save_parquet(df: pl.DataFrame, out_path: Path, compression: str = "zstd") -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
