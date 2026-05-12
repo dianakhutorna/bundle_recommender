@@ -98,7 +98,7 @@ def main() -> None:
     min_cooc = int(cfg.get("min_cooc", 3))
     min_lift = float(cfg.get("min_lift", 2.0))
     top_k_candidates = int(cfg.get("top_k_candidates", 250))
-    catalog_top_k = int(cfg.get("catalog_top_k", 100))
+    catalog_top_k = int(cfg.get("catalog_top_k", 30))
     predict_batch_size = int(cfg.get("predict_batch_size", 200_000))
 
     # ---- load data ----

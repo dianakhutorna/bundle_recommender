@@ -186,15 +186,9 @@ docker buildx build \
 **Latency:** ~2 ms per request (after startup)
 **Memory:** 2 GB per Lambda instance
 
-### Local Testing (Development Only)
+### Production Deployment
 
-For local development, you can test the API with FastAPI's built-in server:
-
-```bash
-# This is NOT used in production — only for local testing
-pip install -r requirements.txt
-./venv/bin/python -m training.src.scripts.serve_recommendations_api
-```
+The API runs on AWS Lambda and is accessed through API Gateway. See [deployment documentation](docs/source/deployment.rst) for details.
 
 **Endpoints:**
 

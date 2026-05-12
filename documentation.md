@@ -258,7 +258,7 @@ Conservative regularization (high L1/L2, low num_leaves/depth) to prevent overfi
 |-----------|-------|---------|
 | `inference_last_n_days` | 90 | How far back to look for orders. 90 days gives 83.6% kiosk coverage. |
 | `top_k_candidates` | 50 | MBA candidates per anchor at inference. Lower than training (100) to keep catalog size manageable. |
-| `catalog_top_k` | 20 | Final number of recommendations stored per (kiosk, anchor) pair. |
+| `catalog_top_k` | 30 | Final number of recommendations stored per (kiosk, anchor) pair. |
 | `predict_batch_size` | 200,000 | Rows per LightGBM predict call (memory safety). |
 
 ### Runtime
@@ -333,22 +333,9 @@ GET /recommendations?kioskId=fe7ef5cd7c27&anchorId=000056-002&limit=30
 ]
 ```
 
-### Local Development
+### Production Serving
 
-For local testing during development (NOT production, use Lambda for production):
-
-```bash
-# Install full dependencies
-pip install -r requirements.txt
-
-# Start server
-./venv/bin/python -m training.src.scripts.serve_recommendations_api
-
-# Access API
-open http://localhost:8000/docs
-```
-
-This loads parquets from local `training/data/interim/` directory (~2 GB RAM).
+The API is served through AWS Lambda and API Gateway. See the [backend architecture documentation](docs/source/backend-architecture.rst) for details on deployment, configuration, and runtime behavior.
 
 ### 4-Level Fallback
 
@@ -588,7 +575,7 @@ inference_max_rows: 0                         # 0 = no limit
 min_cooc: 2                                   # MBA filter: minimum co-occurrence
 min_lift: 1.2                                 # MBA filter: minimum lift
 top_k_candidates: 50                          # MBA candidates per anchor (note: < training top_k=100)
-catalog_top_k: 20                             # Final top-K stored per (kiosk, anchor)
+catalog_top_k: 30                             # Final top-K stored per (kiosk, anchor)
 predict_batch_size: 200000                    # Memory-safe batch size for prediction
 query_sample_n: 0                             # 0 = use all queries (no sampling)
 ```
