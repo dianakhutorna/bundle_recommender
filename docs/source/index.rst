@@ -58,7 +58,12 @@ The system identifies the best products to recommend as bundles paired with spec
    configuration
    testing
    deployment
-
+   backend-architecture
+   api
+   aws-configuration
+   ci-cd
+   prediction-serving
+   troubleshooting
 
 **Index and Search:**
 

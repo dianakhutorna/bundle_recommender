@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - add-backend
+      - cleanup/refactoring
 
 env:
   AWS_REGION: eu-central-1

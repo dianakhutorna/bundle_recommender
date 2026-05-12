@@ -1,84 +1,103 @@
 Deployment
 ==========
 
+This section documents the deployment setup of the batch-based bundle recommender backend.
+
 Overview
 --------
 
-Production serving is deployed on AWS Lambda via Docker image workflow.
+The backend is deployed as a containerized FastAPI service on AWS Lambda.
 
-Deployment path
----------------
+Deployment flow:
 
-1. Train model and generate batch artifacts.
-2. Build Docker image for Lambda runtime.
-3. Push image to registry.
-4. Update Lambda function image through CI/CD.
+::
 
-Documented build command
-------------------------
+   GitHub -> GitHub Actions -> Docker -> Amazon ECR -> AWS Lambda -> API Gateway
 
-.. code-block:: bash
+In addition to code deployment, this backend also depends on a prediction artifact stored in Amazon S3.
 
-   docker buildx build \
-     --platform linux/amd64 \
-     --provenance=false \
-     -t diana-backend:latest \
-     --push .
+Deployment Scope
+----------------
 
-Application entry point
------------------------
+The deployment setup covers:
 
-- Lambda handler target: ``training.src.scripts.lambda_handler.handler``
-- Handler wraps FastAPI app with Mangum.
+- backend code
+- container image build
+- image storage in ECR
+- Lambda deployment
+- API exposure through API Gateway
 
-CI/CD notes
------------
+The prediction artifact lifecycle is separate from the code deployment lifecycle.
 
-Project documentation describes deployment through GitHub Actions workflow ``.github/workflows/deploy.yml``.
+Runtime Model
+-------------
 
-Runtime characteristics
------------------------
+This backend does not compute recommendations during request processing.
 
-Documented characteristics for production serving:
+Instead, it:
 
-- Startup: about 90 seconds
-- Warm request latency: about 2 ms
-- Memory: about 2 GB per Lambda instance
+- loads a precomputed prediction file during startup
+- builds an in-memory lookup
+- serves recommendation results via lookup
 
-Dependencies
-------------
+At a high level:
 
-The project uses two requirement sets:
+::
 
-- ``requirements.txt``: full development/training environment
-- ``requirements-backend.txt``: minimal backend runtime dependencies
+   Offline prediction generation -> predictions.parquet -> S3 -> Lambda startup load -> API response
 
-Local development serving
--------------------------
+Main AWS Components
+-------------------
 
-.. code-block:: bash
+The deployed backend uses:
 
-   pip install -r requirements.txt
-   ./venv/bin/python -m training.src.scripts.serve_recommendations_api
+- Amazon ECR for image storage
+- AWS Lambda for execution
+- Amazon API Gateway for public access
+- Amazon S3 for prediction artifact storage
+- IAM for runtime and deployment permissions
+- CloudWatch Logs for monitoring
 
-Environment variables for API startup
--------------------------------------
+Containerization
+----------------
 
-Serving startup requires:
+The backend is packaged as a Lambda-compatible Docker image.
 
-- ``PREDICTIONS_S3_BUCKET``
-- ``PREDICTIONS_S3_KEY``
+Typical Dockerfile:
 
-Optional:
+.. code-block:: dockerfile
 
-- ``MODEL_ID``
-- ``LOCAL_PREDICTIONS_PATH``
+   FROM public.ecr.aws/lambda/python:3.12
 
-Operational sequence
---------------------
+   COPY requirements-backend.txt .
+   RUN pip install --no-cache-dir -r requirements-backend.txt
 
-To refresh production recommendations:
+   COPY training /var/task/training
 
-1. Run training pipeline.
-2. Run batch scoring pipeline.
-3. Deploy updated serving image/workflow.
+   CMD ["training.src.scripts.lambda_handler.handler"]
+
+The image contains the backend code and runtime dependencies, but not the prediction artifact itself.
+
+Prediction Artifact
+-------------------
+
+The backend depends on the file:
+
+- ``predictions.parquet``
+
+This file is stored separately in Amazon S3 and loaded at runtime.
+
+This design keeps the image smaller and allows prediction data to be updated independently from backend code.
+
+Deployment Validation
+---------------------
+
+After deployment, the following checks are recommended:
+
+1. confirm that the GitHub Actions workflow completed successfully
+2. verify that Lambda references the updated image
+3. call ``/health``
+4. test a known recommendation request
+5. verify that the prediction file is still available in S3
+
+
