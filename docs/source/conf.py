@@ -81,7 +81,7 @@ html_context = {
     'display_github': True,
     'github_user': 'dianakhutorna',
     'github_repo': 'bundle_recommender',
-    'github_version': 'final',
+    'github_version': 'cleanup/refactoring',
     'conf_py_path': '/docs/source/',
 }
 
