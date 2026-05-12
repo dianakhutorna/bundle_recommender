@@ -14,19 +14,20 @@ Flow:
 
 from __future__ import annotations
 
+import gc
+import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-import logging
-import json
 
 import lightgbm as lgb
-import polars as pl
-import pandas as pd
 import numpy as np
+import polars as pl
 
 from training.src.config import load_yaml_config
 from training.src.features import add_all_features, lgbm_feature_exprs
 from training.src.io import (
+    load_orders_csv_chunked,
     load_orders_csv_sample,
     load_products_csv,
     load_commerces_csv,
@@ -88,6 +89,7 @@ class TrainingPipelineConfig:
     num_boost_round: int
     early_stopping_rounds: int
     eval_log_path: Path | None
+    chunk_size: int
 
     @classmethod
     def from_yaml(cls, path: Path) -> "TrainingPipelineConfig":
@@ -122,6 +124,7 @@ class TrainingPipelineConfig:
             num_boost_round=int(data.get("num_boost_round", 2000)),
             early_stopping_rounds=int(data.get("early_stopping_rounds", 100)),
             eval_log_path=Path(data["eval_log_path"]) if data.get("eval_log_path") else None,
+            chunk_size=int(data.get("chunk_size", 2_000_000)),
         )
 
 
@@ -380,24 +383,39 @@ def run(config: TrainingPipelineConfig) -> None:
     # ---- STEP 1: LOAD DATA ----
     _banner("STEP 1 — LOAD DATA")
 
-    per_file = max(1, config.n_rows // len(config.raw_paths))
-    LOGGER.info(
-        "Loading raw paths: %s (per_file=%s, sample_position=%s)",
-        [str(p) for p in config.raw_paths], per_file, config.sample_position,
-    )
-    raw_frames = [
-        load_orders_csv_sample(path, n_rows=per_file, sample_position=config.sample_position)
-        for path in config.raw_paths
-    ]
-    raw_orders = pl.concat(raw_frames, how="vertical")
-    if "order_dt" in raw_orders.columns:
-        dt_stats = raw_orders.select(
-            pl.col("order_dt").min().alias("min_dt"),
-            pl.col("order_dt").max().alias("max_dt"),
-        ).row(0)
-        LOGGER.info("Raw orders date range: %s to %s", dt_stats[0], dt_stats[1])
+    if config.n_rows <= 0:
+        LOGGER.info(
+            "Chunked loading ALL rows from %d files (chunk_size=%s)",
+            len(config.raw_paths), f"{config.chunk_size:,}",
+        )
+        clean_orders = load_orders_csv_chunked(
+            config.raw_paths,
+            preprocess_fn=preprocess_orders,
+            chunk_size=config.chunk_size,
+            out_dir=config.interim_path.parent / "chunk_tmp",
+        )
+    else:
+        per_file = max(1, config.n_rows // len(config.raw_paths))
+        LOGGER.info(
+            "Loading raw paths: %s (per_file=%s, sample_position=%s)",
+            [str(p) for p in config.raw_paths], per_file, config.sample_position,
+        )
+        raw_frames = [
+            load_orders_csv_sample(path, n_rows=per_file, sample_position=config.sample_position)
+            for path in config.raw_paths
+        ]
+        raw_orders = pl.concat(raw_frames, how="vertical")
+        if "order_dt" in raw_orders.columns:
+            dt_stats = raw_orders.select(
+                pl.col("order_dt").min().alias("min_dt"),
+                pl.col("order_dt").max().alias("max_dt"),
+            ).row(0)
+            LOGGER.info("Raw orders date range: %s to %s", dt_stats[0], dt_stats[1])
 
-    clean_orders = preprocess_orders(raw_orders)
+        clean_orders = preprocess_orders(raw_orders)
+        del raw_frames, raw_orders
+        gc.collect()
+
     save_parquet(clean_orders, config.interim_path)
 
     products = load_products_csv(config.products_path)
@@ -425,6 +443,9 @@ def run(config: TrainingPipelineConfig) -> None:
         val_ratio=config.val_ratio,
         test_ratio=config.test_ratio,
     )
+    del clean_orders
+    gc.collect()
+
     for name, df in (("Train", train_orders), ("Val", val_orders), ("Test", test_orders)):
         if df.height == 0:
             LOGGER.info("%s orders: rows=0", name)
@@ -466,6 +487,9 @@ def run(config: TrainingPipelineConfig) -> None:
             pl.col("order_dt").max().alias("max_dt"),
         ).row(0)
         LOGGER.info("  %s orders date range: %s to %s (rows=%s)", name, dt_stats[0], dt_stats[1], df.height)
+
+    del train_sorted
+    gc.collect()
 
     # ---- STEP 3: BUILD BASKETS ----
     _banner("STEP 3 — BUILD BASKETS")
@@ -604,7 +628,7 @@ def run(config: TrainingPipelineConfig) -> None:
 
         # 9) Build features only for selected rows.
         #    For large datasets, process in query batches to avoid OOM.
-        MAX_ROWS_PER_BATCH = 5_000_000
+        MAX_ROWS_PER_BATCH = 2_000_000
 
         # When filtering/sampling happened, only keep selected rows
         if filter_good or do_sample_negatives:
@@ -689,6 +713,9 @@ def run(config: TrainingPipelineConfig) -> None:
         shuffle_seed=None,
         max_queries=config.max_eval_queries,
     )
+
+    del train_orders, train_feat_orders, train_label_orders, val_orders, baskets_train
+    gc.collect()
 
     # ---- Detect feature columns ----
     non_feature_cols = {"kiosk_id", "anchor_product_id", "candidate_product_id", "label"}
@@ -813,10 +840,26 @@ def run(config: TrainingPipelineConfig) -> None:
         LOGGER.info("Best metrics: %s", best)
 
     # Feature importance
-    imp_df = pd.DataFrame(
-        {"feature": feature_cols, "importance": booster.feature_importance(importance_type="gain")}
-    ).sort_values("importance", ascending=False)
-    LOGGER.info("Feature importance (gain):\n%s", imp_df.to_string(index=False))
+    importances = booster.feature_importance(importance_type="gain")
+    feature_importance_list = sorted(
+        zip(feature_cols, importances),
+        key=lambda x: x[1],
+        reverse=True
+    )
+    importance_str = "\n".join(
+        f"{feat:20s} {imp:15.6e}" for feat, imp in feature_importance_list
+    )
+    LOGGER.info("Feature importance (gain):\n%s", importance_str)
+
+    # Save artifacts before offline evaluation so the model is preserved
+    # even if evaluation fails.
+    config.model_path.parent.mkdir(parents=True, exist_ok=True)
+    booster.save_model(str(config.model_path))
+    LOGGER.info("Model saved to %s", config.model_path)
+
+    feature_path = config.model_path.with_suffix(".features.json")
+    feature_path.write_text(json.dumps(feature_cols, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOGGER.info("Feature list saved to %s", feature_path)
 
     # ---- STEP 7: OFFLINE EVALUATION ----
     _banner("STEP 7 — OFFLINE EVALUATION")
@@ -889,11 +932,4 @@ def run(config: TrainingPipelineConfig) -> None:
 
     # ---- STEP 8: SAVE ARTIFACTS ----
     _banner("STEP 8 — SAVE ARTIFACTS")
-
-    config.model_path.parent.mkdir(parents=True, exist_ok=True)
-    booster.save_model(str(config.model_path))
-    LOGGER.info("Model saved to %s", config.model_path)
-
-    feature_path = config.model_path.with_suffix(".features.json")
-    feature_path.write_text(json.dumps(feature_cols, ensure_ascii=False, indent=2), encoding="utf-8")
-    LOGGER.info("Feature list saved to %s", feature_path)
+    LOGGER.info("Artifacts already saved before offline evaluation.")
